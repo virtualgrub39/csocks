@@ -1,22 +1,22 @@
-C_FILES = $(wildcard *.c)
-O_FILES = $(C_FILES:.c=.o)
+SRC = $(wildcard *.c)
+OBJ = $(SRC:.c=.o)
 
-CSOCKS_CFLAGS = $(CFLAGS) -Wall -Werror -pedantic -ggdb
-
-csocks: csocks.o utils.o utils.h config.h
-	gcc -o $@ $^ $(CSOCKS_CFLAGS)
-
-%.o: %.c config.h
-	gcc -c $^ $(CSOCKS_CFLAGS)
+CSOCKS_CFLAGS = $(CFLAGS) -Wall -Werror -pedantic
 
 all: csocks
 
-clean:
-	-rm -f $(O_FILES)
-	-rm -f csocks 
+config.h: config.def.h
 
-config.h: config.default.h
-	cp config.default.h config.h
+.c.o:
+	$(CC) $(CSOCKS_CFLAGS) -c $<
+
+utils.o: config.h utils.h
+csocks.o: config.h
+
+csocks: $(OBJ)
+	$(CC) -o $@ $(OBJ)
+
+clean:
+	rm -f csocks $(OBJ)
 
 .PHONY: all clean
-.DEFAULT: all
