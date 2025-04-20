@@ -33,7 +33,7 @@ usage(const char* progname)
 	fprintf(log_file, "\t-h - display this message\n");
 	fprintf(log_file, "\t-n <port> - set port to listen on. [default = 1080]\n");
 	fprintf(log_file, "\t-a <auth file path> - read docs :) [deafult = NULL]\n");
-	fprintf(log_file, "\t-l <log file path> - set file for logging output. [default = log_file]\n");
+	fprintf(log_file, "\t-l <log file path> - set file for logging output. [default = stderr]\n");
 
 	exit(EXIT_FAILURE);
 }

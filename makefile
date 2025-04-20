@@ -6,6 +6,7 @@ CSOCKS_CFLAGS = $(CFLAGS) -Wall -Werror -pedantic
 all: csocks
 
 config.h: config.def.h
+	cp config.def.h config.h
 
 .c.o:
 	$(CC) $(CSOCKS_CFLAGS) -c $<
