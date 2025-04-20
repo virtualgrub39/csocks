@@ -1,0 +1,4 @@
+*.o
+csocks
+*.log
+config.h
