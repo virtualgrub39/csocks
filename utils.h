@@ -7,15 +7,17 @@
 
 #define UNREACHABLE 									\
 	do { 												\
-		 assert(!"Entered unreachable block of code"); 	\
-		 abort();										\
+		assert(!"Entered unreachable block of code"); 	\
+		abort();										\
 	} while (0)
 
 #define TODO(msg)									\
 	do {											\
-		 assert("TODO: " && !msg);								\
-		 abort();									\
+		assert("TODO: " && !msg);					\
+		abort();									\
 	} while (0)
+
+#define EVER ;;
 
 enum {
 	INFO,

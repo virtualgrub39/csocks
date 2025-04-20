@@ -1,11 +1,13 @@
 C_FILES = $(wildcard *.c)
 O_FILES = $(C_FILES:.c=.o)
 
-csocks: csocks.o utils.o utils.h config.h
-	gcc -o $@ $^ -ggdb
+CSOCKS_CFLAGS = $(CFLAGS) -Wall -Werror -pedantic -ggdb
 
-%.o: %.c
-	gcc -c $^
+csocks: csocks.o utils.o utils.h config.h
+	gcc -o $@ $^ $(CSOCKS_CFLAGS)
+
+%.o: %.c config.h
+	gcc -c $^ $(CSOCKS_CFLAGS)
 
 all: csocks
 

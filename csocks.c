@@ -76,10 +76,80 @@ daemonize(void)
 	}
 }
 
+void*
+client_conn_handler(void* arg)
+{
+	int client_sockfd = (int)(intptr_t)arg;
+
+	log_msg(log_file, INFO, "Nyaa ~~ <3 %d", client_sockfd);
+	close(client_sockfd);
+	return NULL;
+}
+
 void
 serv_loop(void)
 {
-	TODO("Everything?");
+	int serv_sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (serv_sockfd < 0) {
+		log_msg(log_file, ERROR, "socket(): %u", errno);
+		exit(1);
+	}
+
+	int optval = 1;
+
+	if (setsockopt(serv_sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+		log_msg(log_file, ERROR, "setsockopt(SO_REUSEADDR): %u", errno);
+		goto sock_err;
+	}
+
+	// TODO: ipv6 mode?
+	struct sockaddr_in bind_addr = { 0 };
+	bind_addr.sin_family = AF_INET;
+	bind_addr.sin_port = htons(bind_port);
+	bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	if (bind(serv_sockfd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+		log_msg(log_file, ERROR, "bind(): %u", errno);
+		goto sock_err;
+	}
+
+	if (listen(serv_sockfd, LISTEN_BACKLOG_SIZE) < 0) {
+		log_msg(log_file, ERROR, "listen(): %u", errno);
+		goto sock_err;
+	}
+
+	log_msg(log_file, INFO, "Server listening on :%lu", bind_port);
+
+	for (EVER) {
+		struct sockaddr_in remote_addr = { 0 };
+		socklen_t remote_len = 0;
+
+		int client_sockfd = accept(serv_sockfd, (struct sockaddr*)&remote_addr, &remote_len);
+		if (client_sockfd < 0) {
+			log_msg(log_file, ERROR, "Failed to accept client connection: %s", strerror(errno));
+			continue;
+		}
+
+		optval = 1;
+		if (setsockopt(serv_sockfd, SOL_TCP, TCP_NODELAY, &optval, sizeof(optval)) < 0) {
+			log_msg(log_file, ERROR, "setsockopt(TCP_NODELAY): %u", errno);
+			close(client_sockfd);
+			goto sock_err;
+		}
+
+		pthread_t t;
+		if (pthread_create(&t, NULL, &client_conn_handler, (void*)&client_sockfd) == 0) {
+			pthread_detach(t);
+		} else {
+			log_msg(log_file, ERROR, "pthread_detach(): %u", errno);
+		}
+	}
+
+	return;
+
+sock_err:
+	close(serv_sockfd);
+	exit(1);
 }
 
 int
@@ -126,10 +196,12 @@ main(int argc, char* argv[])
 		log_msg(log_file, INFO, "Using auth file for USERPASS credentials");
 	} else {
 		log_msg(log_file, WARNING, "No auth file provided");
-		log_msg(log_file, INFO, "username: %s", auth_default_username);
-		log_msg(log_file, INFO, "password: %s", auth_default_passwd);
+		if (!auth_default_username || !auth_default_passwd) {
+			log_msg(log_file, ERROR, "You have to either provide auth file or set default username and password.");
+		}
+		log_msg(log_file, INFO, "Username: %s", auth_default_username);
+		log_msg(log_file, INFO, "Password: %s", auth_default_passwd);
 	}
-	log_msg(log_file, INFO, "Server listening on :%lu", bind_port);
 
 	serv_loop();
 
