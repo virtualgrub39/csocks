@@ -1,7 +1,7 @@
 SRC = $(wildcard *.c)
 OBJ = $(SRC:.c=.o)
 
-CSOCKS_CFLAGS = $(CFLAGS) -Wall -Werror -pedantic
+CSOCKS_CFLAGS = $(CFLAGS) -Wall -Werror -pedantic -Wextra -ggdb
 CSOCKS_LDFLAGS = $(LDFLAGS) -static
 
 all: csocks

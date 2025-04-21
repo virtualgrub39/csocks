@@ -76,17 +76,38 @@ daemonize(void)
 	}
 }
 
+// to prevent partial recv()'s
+static ssize_t
+recv_full(int fd, void *buf, size_t len, int flags) {
+	uint8_t *p = buf;
+	size_t got = 0;
+	while (got < len) {
+		ssize_t n = recv(fd, p + got, len - got, flags);
+		if (n <= 0) return n;
+		got += n;
+	}
+	return got;
+}
+
 bool
-socks_identifier(int sockfd, uint8_t* version, uint8_t* nmethods, uint8_t* methods)
+socks_identifier(int sockfd, uint8_t* version, uint8_t* nmethods, uint8_t methods[255])
 {
-	(void)sockfd;
-	*version = 0;
-	*nmethods = 0;
-	(void)methods;
+	ssize_t n = recv(sockfd, version, 1, 0);
+	if (n <= 0) goto socks_identifier_failure;
+	n = recv(sockfd, nmethods, 1, 0);
+	if (n <= 0) goto socks_identifier_failure;
+	n = recv_full(sockfd, methods, *nmethods, 0);
+	if (n <= 0) goto socks_identifier_failure;
+	if (n != *nmethods) {
+		// malformed request
+		return false;
+	}
+	return true;
 
-	TODO("socks_identifier()");
-	// TODO: make sure no buffer overflow in methods :)
-
+socks_identifier_failure:
+	if (n < 0) {
+		log_msg(log_file, ERROR, "recv failed: %s", strerror(errno));
+	}
 	return false;
 }
 
@@ -133,7 +154,6 @@ client_conn_handler(void* arg)
 		NOAUTH = 0x00,
 		GSSAPI = 0x01, // see readme.md
 		USERPASS = 0x02,
-		// ... // TODO: custom methods?
 		METHOD_NOT_ACCEPTABLE = 0xFF,
 	} method = METHOD_NOT_ACCEPTABLE;
 
@@ -156,16 +176,16 @@ client_conn_handler(void* arg)
 	write(client_sockfd, &method, 1);
 
 	switch (method) {
-	case USERPASS: {
+	case USERPASS: 
 		if (!socks_auth_userpass(client_sockfd)) {
 			// authentication failed
 			goto client_handler_end;
 		}
-		// falls throught to the default behavior
-	}
-	case NOAUTH: {
 		socks_handle_request_default(client_sockfd);
-	} break;
+		break; // implicit falling through is forbidden with -Wextra apparently.
+	case NOAUTH:
+		socks_handle_request_default(client_sockfd);
+		break;
 	default:
 		log_msg(log_file, ERROR, "Unsupported authentication method: %02X", method);
 	case METHOD_NOT_ACCEPTABLE:
@@ -180,6 +200,8 @@ client_handler_end:
 void
 serv_loop(void)
 {
+	signal(SIGPIPE, SIG_IGN);
+
 	int serv_sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (serv_sockfd < 0) {
 		log_msg(log_file, ERROR, "socket(): %u", errno);
@@ -193,7 +215,6 @@ serv_loop(void)
 		goto sock_err;
 	}
 
-	// TODO: ipv6 mode?
 	struct sockaddr_in bind_addr = { 0 };
 	bind_addr.sin_family = AF_INET;
 	bind_addr.sin_port = htons(bind_port);
@@ -298,3 +319,9 @@ main(int argc, char* argv[])
 
 	return 0;
 }
+
+// TODO: non-blocking sockets?
+// TODO: workers / thread pool instead of thread per connection?
+// TODO: other authentication methods
+// TODO: ipv6 support
+// TODO: GSSAPI support?
