@@ -76,12 +76,103 @@ daemonize(void)
 	}
 }
 
+bool
+socks_identifier(int sockfd, uint8_t* version, uint8_t* nmethods, uint8_t* methods)
+{
+	(void)sockfd;
+	*version = 0;
+	*nmethods = 0;
+	(void)methods;
+
+	TODO("socks_identifier()");
+	// TODO: make sure no buffer overflow in methods :)
+
+	return false;
+}
+
+bool
+socks_auth_userpass(int sockfd)
+{
+	(void)sockfd;
+
+	TODO("socks_auth_userpass()");
+
+	return false;
+}
+
+void
+socks_handle_request_default(int sockfd)
+{
+	(void)sockfd;
+
+	TODO("socks_handle_request_default()");
+
+	return;
+}
+
 void*
 client_conn_handler(void* arg)
 {
 	int client_sockfd = (int)(intptr_t)arg;
 
-	log_msg(log_file, INFO, "Nyaa ~~ <3 %d", client_sockfd);
+	uint8_t version;
+	uint8_t nmethods;
+	uint8_t methods[255];
+
+	if (!socks_identifier(client_sockfd, &version, &nmethods, methods)) {
+		// invalid socks request
+		goto client_handler_end;
+	}
+
+	if (version != 4 && version != 5) {
+		log_msg(log_file, WARNING, "Client requested unsupported SOCKS version: %u", version);
+		goto client_handler_end;
+	}
+
+	enum {
+		NOAUTH = 0x00,
+		GSSAPI = 0x01, // see readme.md
+		USERPASS = 0x02,
+		// ... // TODO: custom methods?
+		METHOD_NOT_ACCEPTABLE = 0xFF,
+	} method = METHOD_NOT_ACCEPTABLE;
+
+	for (uint8_t i = 0; i < nmethods; ++i) {
+		if (methods[i] == USERPASS) {
+			if ((auth_default_username && auth_default_passwd) || auth_file) {
+				method = USERPASS;
+				break;
+			}
+		}
+		if (methods[i] == NOAUTH) {
+			if (auth_allow_noauth) {
+				method = NOAUTH;
+				break;
+			}
+		}
+	}
+
+	write(client_sockfd, &version, 1);
+	write(client_sockfd, &method, 1);
+
+	switch (method) {
+	case USERPASS: {
+		if (!socks_auth_userpass(client_sockfd)) {
+			// authentication failed
+			goto client_handler_end;
+		}
+		// falls throught to the default behavior
+	}
+	case NOAUTH: {
+		socks_handle_request_default(client_sockfd);
+	} break;
+	default:
+		log_msg(log_file, ERROR, "Unsupported authentication method: %02X", method);
+	case METHOD_NOT_ACCEPTABLE:
+		goto client_handler_end;
+	}
+
+client_handler_end:
 	close(client_sockfd);
 	return NULL;
 }
@@ -138,7 +229,7 @@ serv_loop(void)
 		}
 
 		pthread_t t;
-		if (pthread_create(&t, NULL, &client_conn_handler, (void*)&client_sockfd) == 0) {
+		if (pthread_create(&t, NULL, &client_conn_handler, (void*)(intptr_t)client_sockfd) == 0) {
 			pthread_detach(t);
 		} else {
 			log_msg(log_file, ERROR, "pthread_detach(): %u", errno);
@@ -197,7 +288,7 @@ main(int argc, char* argv[])
 	} else {
 		log_msg(log_file, WARNING, "No auth file provided");
 		if (!auth_default_username || !auth_default_passwd) {
-			log_msg(log_file, ERROR, "You have to either provide auth file or set default username and password.");
+			log_msg(log_file, WARNING, "USERNAME/PASSWORD authentication disabled");
 		}
 		log_msg(log_file, INFO, "Username: %s", auth_default_username);
 		log_msg(log_file, INFO, "Password: %s", auth_default_passwd);

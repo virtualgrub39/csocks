@@ -2,6 +2,7 @@ SRC = $(wildcard *.c)
 OBJ = $(SRC:.c=.o)
 
 CSOCKS_CFLAGS = $(CFLAGS) -Wall -Werror -pedantic
+CSOCKS_LDFLAGS = $(LDFLAGS) -static
 
 all: csocks
 
@@ -15,7 +16,7 @@ utils.o: config.h utils.h
 csocks.o: config.h
 
 csocks: $(OBJ)
-	$(CC) -o $@ $(OBJ)
+	$(CC) -o $@ $(OBJ) $(CSOCKS_LDFLAGS)
 
 clean:
 	rm -f csocks $(OBJ)
