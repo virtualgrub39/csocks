@@ -35,7 +35,7 @@ usage(const char* progname)
 	fprintf(log_file, "\t-a <auth file path> - read docs :) [deafult = NULL]\n");
 	fprintf(log_file, "\t-l <log file path> - set file for logging output. [default = stderr]\n");
 
-	exit(EXIT_FAILURE);
+	exit(EXIT_SUCCESS);
 }
 
 void
