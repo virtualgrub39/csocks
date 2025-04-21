@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <netdb.h>
 
 #include "utils.h"
 #include "config.h"
@@ -23,6 +24,24 @@ FILE* log_file;
 FILE* auth_file = NULL;
 bool daemonized = false;
 unsigned long bind_port = 1080;
+
+enum sockserrcode {
+	SUCCESS,
+	GENERAL_FAILURE,
+	CONNECTION_NO_ALLOWED,
+	NETWORK_UNREACHABLE,
+	HOST_UNREACHABLE,
+	CONNECTION_REFUSED,
+	TTL_EXPIRED,
+	COMMAND_NOT_SUPPORTED,
+	ADDRESS_TYPE_NOT_SUPPORTED,
+};
+
+enum socksaddrtype {
+	IPV4 = 0x01,
+	DOMAINNAME = 0x03,
+	IPV6 = 0x04,
+};
 
 void
 usage(const char* progname)
@@ -121,15 +140,91 @@ socks_auth_userpass(int sockfd)
 	return false;
 }
 
+bool
+socks_parse_addr(int atype, uint8_t* addr, uint16_t port, struct sockaddr_storage* sa, socklen_t* sa_len)
+{
+	switch (atype) {
+	case IPV4: {
+		struct sockaddr_in* sa4 = (struct sockaddr_in*)sa;
+
+		sa4->sin_family = AF_INET;
+		sa4->sin_port = htons(port);
+		memcpy(&sa4->sin_addr.s_addr, addr, 4);
+		*sa_len = sizeof(struct sockaddr_in);
+	} break;
+	case IPV6: {
+		struct sockaddr_in6* sa6 = (struct sockaddr_in6*)sa;
+
+		sa6->sin6_family = AF_INET6;
+		sa6->sin6_port = htons(port);
+		memcpy(&sa6->sin6_addr.s6_addr, addr, 16);
+		*sa_len = sizeof(struct sockaddr_in6);
+	} break;
+	case DOMAINNAME: {
+		struct sockaddr_in* sa4 = (struct sockaddr_in*)sa;
+
+		struct hostent* he = gethostbyname((char*)addr);
+		if (!he) return false;
+
+		sa4->sin_family = AF_INET;
+		sa4->sin_port = htons(port);
+		memcpy(&sa4->sin_addr, he->h_addr, he->h_length);
+		*sa_len = sizeof(he->h_length);
+
+	    break;
+	}
+	default: UNREACHABLE;
+	}
+
+	return true;
+}
+
 int
 socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 {
-	(void)client_sockfd;
-	(void)atype;
-	(void)addr;
-	(void)port;
+	enum sockserrcode errval = SUCCESS;
+	uint8_t erreply[10] = {
+		5,
+		(uint8_t) errval,
+		0x00,
+		IPV4,
+		0, 0, 0, 0,
+		0, 0
+	};
 
-	TODO("socks_connect()");
+	int netsockfd = -1;
+	struct sockaddr_storage sa = { 0 };
+	socklen_t sa_len = 0;
+	// I love IPv6, such a useful protocol :)
+
+	if !(socks_parse_addr(atype, addr, port, &sa, &sa_len)) {
+		errval = GENERAL_FAILURE;
+		goto socks_connect_error;
+	}
+
+	switch (atype) {
+	case IPV4: {
+		netsockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	} break;
+	case IPV6: {
+		netsockfd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+	} break;
+	case DOMAINNAME: {
+	    netsockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	} break;
+	default: UNREACHABLE;
+	}
+
+	if (connect(netsockfd, (struct sockaddr*)&sa, sa_len) < 0) {
+		errval = GENERAL_FAILURE;
+		goto socks_connect_error;
+	}
+
+	return netsockfd;
+
+socks_connect_error:
+	erreply[1] = errval;
+	write(client_sockfd, erreply, 10);
 
 	return -1;
 }
@@ -180,35 +275,56 @@ socks_udp_relay(int sockfd)
 void
 socks_handle_request_default(int sockfd)
 {
-	uint8_t version;
+	uint8_t version = 0x05;
+	
 	enum {
 		CONNECT = 0x01,
 		BIND = 0x02,
 		UDP_ASSOCIATE = 0x03,
 	} command;
-	uint8_t rsv;
-	enum {
-		IPV4 = 0x01,
-		DOMAINNAME = 0x03,
-		IPV6 = 0x04,
-	} atype;
+	
+	uint8_t rsv = 0x00;
+	enum socksaddrtype atype;
+
 	uint8_t addr_buffer[256] = { 0 };
 	uint8_t addr_len = 0;
 	uint16_t addr_port = 0;
+	
+	enum sockserrcode errval = SUCCESS;
+	uint8_t erreply[10] = {
+		version,
+		(uint8_t) errval,
+		0x00,
+		IPV4,
+		0, 0, 0, 0,
+		0, 0
+	};
 
 	ssize_t n = recv(sockfd, &version, 1, 0);
-	if (n <= 0) goto handle_request_default_end;
+	if (n <= 0) {
+		errval = GENERAL_FAILURE;
+		goto handle_request_default_error;
+	}
 
 	n = recv(sockfd, (uint8_t*)&command, 1, 0);
-	if (n <= 0) goto handle_request_default_end;
+	if (n <= 0) {
+		errval = GENERAL_FAILURE;
+		goto handle_request_default_error;
+	}
 
 	n = recv(sockfd, &rsv, 1, 0);
-	if (n <= 0) goto handle_request_default_end;
+	if (n <= 0) {
+		errval = GENERAL_FAILURE;
+		goto handle_request_default_error;
+	}
 
 	n = recv(sockfd, (uint8_t*)&atype, 1, 0);
-	if (n <= 0) goto handle_request_default_end;
+	if (n <= 0) {
+		errval = GENERAL_FAILURE;
+		goto handle_request_default_error;
+	}
 
-	// Golang-ass code smh my head
+	// FIXME: Golang-ass code smh my head
 
 	switch (atype) {
 	case IPV4:
@@ -216,22 +332,30 @@ socks_handle_request_default(int sockfd)
 		break;
 	case DOMAINNAME: 
 		n = recv(sockfd, &addr_len, 1, 0);
-		if (n <= 0 || addr_len == 0)
-			goto handle_request_default_end;
+		if (n <= 0 || addr_len == 0) {
+			errval = GENERAL_FAILURE;
+			goto handle_request_default_error;
+		}
 		break;
 	case IPV6:
 		addr_len = 16;
 		break;
 	default:
-		// invalid address type
-		goto handle_request_default_end;
+		errval = ADDRESS_TYPE_NOT_SUPPORTED;
+		goto handle_request_default_error;
 	}
 
 	n = recv_full(sockfd, addr_buffer, addr_len, 0);
-	if (n != addr_len) goto handle_request_default_end;
+	if (n != addr_len) {
+		errval = GENERAL_FAILURE;
+		goto handle_request_default_error;
+	}
 
 	n = recv_full(sockfd, &addr_port, 2, 0);
-	if (n != 2) goto handle_request_default_end;
+	if (n != 2) {
+		errval = GENERAL_FAILURE;
+		goto handle_request_default_error;
+	}
 	addr_port = htons(addr_port);
 
 	int netsockfd = -1;
@@ -244,10 +368,11 @@ socks_handle_request_default(int sockfd)
 	case UDP_ASSOCIATE:
 		netsockfd = socks_udp_associate(sockfd, atype, addr_buffer, addr_port); break;
 	default:
-		goto handle_request_default_end;
+		errval = COMMAND_NOT_SUPPORTED;
+		goto handle_request_default_error;
 	}
 
-	if (netsockfd < 0) goto handle_request_default_end;
+	if (netsockfd < 0) goto handle_request_default_end; // error message sent by command-specific function
 
 	if (command == CONNECT || command == BIND)
 		socks_tcp_pipe(sockfd, netsockfd);
@@ -256,6 +381,11 @@ socks_handle_request_default(int sockfd)
 
 handle_request_default_end:
 	return;
+
+handle_request_default_error:
+	erreply[1] = errval;
+
+	write(sockfd, erreply, 10);
 }
 
 void*
