@@ -39,7 +39,7 @@ usage(const char* progname)
 }
 
 void
-daemonize(void)
+daemonize(void) // TODO: Does this even work? Haven't tested it.
 {
 	pid_t pid;
 	int x;
@@ -121,13 +121,140 @@ socks_auth_userpass(int sockfd)
 	return false;
 }
 
+int
+socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
+{
+	(void)client_sockfd;
+	(void)atype;
+	(void)addr;
+	(void)port;
+
+	TODO("socks_connect()");
+
+	return -1;
+}
+
+int
+socks_bind(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
+{
+	(void)client_sockfd;
+	(void)atype;
+	(void)addr;
+	(void)port;
+
+	TODO("socks_bind()");
+
+	return -1;
+}
+
+int
+socks_udp_associate(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
+{
+	(void)client_sockfd;
+	(void)atype;
+	(void)addr;
+	(void)port;
+
+	TODO("socks_udp_associate()");
+
+	return -1;
+}
+
 void
-socks_handle_request_default(int sockfd)
+socks_tcp_pipe(int Afd, int Bfd)
+{
+	(void)Afd;
+	(void)Bfd;
+
+	TODO("socks_tcp_pipe()");
+}
+
+void
+socks_udp_relay(int sockfd)
 {
 	(void)sockfd;
 
-	TODO("socks_handle_request_default()");
+	TODO("socks_udp_relay()");
+}
 
+void
+socks_handle_request_default(int sockfd)
+{
+	uint8_t version;
+	enum {
+		CONNECT = 0x01,
+		BIND = 0x02,
+		UDP_ASSOCIATE = 0x03,
+	} command;
+	uint8_t rsv;
+	enum {
+		IPV4 = 0x01,
+		DOMAINNAME = 0x03,
+		IPV6 = 0x04,
+	} atype;
+	uint8_t addr_buffer[256] = { 0 };
+	uint8_t addr_len = 0;
+	uint16_t addr_port = 0;
+
+	ssize_t n = recv(sockfd, &version, 1, 0);
+	if (n <= 0) goto handle_request_default_end;
+
+	n = recv(sockfd, (uint8_t*)&command, 1, 0);
+	if (n <= 0) goto handle_request_default_end;
+
+	n = recv(sockfd, &rsv, 1, 0);
+	if (n <= 0) goto handle_request_default_end;
+
+	n = recv(sockfd, (uint8_t*)&atype, 1, 0);
+	if (n <= 0) goto handle_request_default_end;
+
+	// Golang-ass code smh my head
+
+	switch (atype) {
+	case IPV4:
+		addr_len = 4;
+		break;
+	case DOMAINNAME: 
+		n = recv(sockfd, &addr_len, 1, 0);
+		if (n <= 0 || addr_len == 0)
+			goto handle_request_default_end;
+		break;
+	case IPV6:
+		addr_len = 16;
+		break;
+	default:
+		// invalid address type
+		goto handle_request_default_end;
+	}
+
+	n = recv_full(sockfd, addr_buffer, addr_len, 0);
+	if (n != addr_len) goto handle_request_default_end;
+
+	n = recv_full(sockfd, &addr_port, 2, 0);
+	if (n != 2) goto handle_request_default_end;
+	addr_port = htons(addr_port);
+
+	int netsockfd = -1;
+
+	switch (command) {
+	case CONNECT:
+		netsockfd = socks_connect(sockfd, atype, addr_buffer, addr_port); break;
+	case BIND:
+		netsockfd = socks_bind(sockfd, atype, addr_buffer, addr_port); break;
+	case UDP_ASSOCIATE:
+		netsockfd = socks_udp_associate(sockfd, atype, addr_buffer, addr_port); break;
+	default:
+		goto handle_request_default_end;
+	}
+
+	if (netsockfd < 0) goto handle_request_default_end;
+
+	if (command == CONNECT || command == BIND)
+		socks_tcp_pipe(sockfd, netsockfd);
+	else if (command == UDP_ASSOCIATE)
+		socks_udp_relay(netsockfd);
+
+handle_request_default_end:
 	return;
 }
 
@@ -138,7 +265,7 @@ client_conn_handler(void* arg)
 
 	uint8_t version;
 	uint8_t nmethods;
-	uint8_t methods[255];
+	uint8_t methods[256];
 
 	if (!socks_identifier(client_sockfd, &version, &nmethods, methods)) {
 		// invalid socks request
@@ -320,6 +447,7 @@ main(int argc, char* argv[])
 	return 0;
 }
 
+// TODO: auth file format definition and parsing
 // TODO: non-blocking sockets?
 // TODO: workers / thread pool instead of thread per connection?
 // TODO: other authentication methods

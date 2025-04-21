@@ -5,7 +5,9 @@
 
 SOCKS5/4a/4 server implementation.
 
-I aim for the implementation to be fully compliant, but the `GSSAPI` stuff may prevent that from happening
+I aim for the implementation to be fully compliant, but the `GSSAPI` stuff may prevent that from happening.
+
+Heap is for loosers btw. Real programmers work on registers. /s
 
 ## Building
 
