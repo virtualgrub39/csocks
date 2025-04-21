@@ -9,8 +9,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Clone repo
-      uses: actions/checkout@v4
-      - name: Build
-      run: make all
+        uses: actions/checkout@v4
+
+      - name: Build (with ${{ matrix.cc }})
+        run: |
+          CC=${{ matrix.cc }} make all
+
       - name: Run usage
-      run: ./csocks -h
+        run: |
+          ./csocks -h
