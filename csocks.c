@@ -197,7 +197,7 @@ socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 	socklen_t sa_len = 0;
 	// I love IPv6, such a useful protocol :)
 
-	if !(socks_parse_addr(atype, addr, port, &sa, &sa_len)) {
+	if (!socks_parse_addr(atype, addr, port, &sa, &sa_len)) {
 		errval = GENERAL_FAILURE;
 		goto socks_connect_error;
 	}
