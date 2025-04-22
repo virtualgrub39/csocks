@@ -1,3 +1,4 @@
+#define _GNU_SOURCE // TODO: get rid of this shit
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -16,6 +17,8 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <netdb.h>
+#include <poll.h>
+#include <fcntl.h>
 
 #include "utils.h"
 #include "config.h"
@@ -179,11 +182,44 @@ socks_parse_addr(int atype, uint8_t* addr, uint16_t port, struct sockaddr_storag
 	return true;
 }
 
+static char*
+get_addr_printable(int atype, uint8_t* addr)
+{
+    static _Thread_local char addrstring[INET6_ADDRSTRLEN + 1];
+    
+    switch (atype) {
+        case IPV4: {
+            snprintf(addrstring, sizeof(addrstring), "%d.%d.%d.%d",
+                     addr[0], addr[1], addr[2], addr[3]);
+            break;
+        }
+        case IPV6: {
+            snprintf(addrstring, sizeof(addrstring),
+                     "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+                     addr[0], addr[1], addr[2], addr[3],
+                     addr[4], addr[5], addr[6], addr[7],
+                     addr[8], addr[9], addr[10], addr[11],
+                     addr[12], addr[13], addr[14], addr[15]);
+            break;
+        }
+        case DOMAINNAME: {
+            strncpy(addrstring, (char*)addr, sizeof(addrstring) - 1);
+            addrstring[sizeof(addrstring) - 1] = '\0';
+            break;
+        }
+        default:
+            snprintf(addrstring, sizeof(addrstring), "<unknown address type>");
+            break;
+    }
+    
+    return addrstring;
+}
+
 int
 socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 {
 	enum sockserrcode errval = SUCCESS;
-	uint8_t erreply[10] = {
+	uint8_t reply[10] = {
 		5,
 		(uint8_t) errval,
 		0x00,
@@ -196,6 +232,8 @@ socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 	struct sockaddr_storage sa = { 0 };
 	socklen_t sa_len = 0;
 	// I love IPv6, such a useful protocol :)
+
+	log_msg(log_file, INFO, "Request: CONNECT %s:%u", get_addr_printable(atype, addr), port);
 
 	if (!socks_parse_addr(atype, addr, port, &sa, &sa_len)) {
 		errval = GENERAL_FAILURE;
@@ -220,11 +258,35 @@ socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 		goto socks_connect_error;
 	}
 
+	if (getsockname(netsockfd, (struct sockaddr*)&sa, &sa_len) < 0) {
+		close(netsockfd);
+		errval = GENERAL_FAILURE;
+		goto socks_connect_error;
+	}
+
+	switch (sa_len) {
+	case sizeof(struct sockaddr_in): {
+		reply[1] = SUCCESS;
+		memcpy(reply + 4, &((struct sockaddr_in*)&sa)->sin_addr.s_addr, 4);
+		memcpy(reply + 8, &((struct sockaddr_in*)&sa)->sin_port, 2);
+
+		write(client_sockfd, reply, 10);
+	} break;
+	case sizeof(struct sockaddr_in6): {
+		TODO("socks_connect() IPv6");
+	} break;
+	default:
+		errval = GENERAL_FAILURE;
+		goto socks_connect_error;
+	}
+
 	return netsockfd;
 
 socks_connect_error:
-	erreply[1] = errval;
-	write(client_sockfd, erreply, 10);
+ 	reply[1] = errval;
+	write(client_sockfd, reply, 10);
+
+	log_msg(log_file, WARNING, "Connect request failed with errval: %u", errval);
 
 	return -1;
 }
@@ -258,10 +320,60 @@ socks_udp_associate(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 void
 socks_tcp_pipe(int Afd, int Bfd)
 {
-	(void)Afd;
-	(void)Bfd;
+	log_msg(log_file, INFO, "Piping TCP sockets %d <-> %d", Afd, Bfd);
 
-	TODO("socks_tcp_pipe()");
+    int pipeAB[2], pipeBA[2];
+    struct pollfd fds[2] = {
+        { .fd = Afd, .events = POLLIN  },
+        { .fd = Bfd, .events = POLLIN  }
+    };
+    if (pipe(pipeAB) < 0 || pipe(pipeBA) < 0) {
+        log_msg(log_file, ERROR, "pipe() Failed: %s", strerror(errno));
+        return;
+    }
+
+    for (EVER) {
+        int ret = poll(fds, 2, -1);
+        if (ret < 0 && errno == EINTR) continue;
+        if (ret <= 0) break;
+
+        /* A → B */
+        if (fds[0].revents & POLLIN) {
+            ssize_t n = splice(Afd, NULL,
+                               pipeAB[1], NULL,
+                               SPLICE_SIZE,
+                               SPLICE_F_MOVE | SPLICE_F_MORE);
+            if (n <= 0) break;
+            if (splice(pipeAB[0], NULL,
+                       Bfd,     NULL,
+                       n,
+                       SPLICE_F_MOVE | SPLICE_F_MORE) <= 0)
+                break;
+        }
+
+        /* B → A */
+        if (fds[1].revents & POLLIN) {
+            ssize_t n = splice(Bfd, NULL,
+                               pipeBA[1], NULL,
+                               SPLICE_SIZE,
+                               SPLICE_F_MOVE | SPLICE_F_MORE);
+            if (n <= 0) break;
+            if (splice(pipeBA[0], NULL,
+                       Afd,     NULL,
+                       n,
+                       SPLICE_F_MOVE | SPLICE_F_MORE) <= 0)
+                break;
+        }
+
+        if ((fds[0].revents | fds[1].revents) &
+            (POLLERR|POLLHUP|POLLNVAL))
+            break;
+    }
+
+    close(pipeAB[0]); close(pipeAB[1]);
+    close(pipeBA[0]); close(pipeBA[1]);
+
+	log_msg(log_file, INFO, "Stopped piping TCP sockets %d <-> %d", Afd, Bfd);
 }
 
 void
