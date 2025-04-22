@@ -13,8 +13,8 @@ config.h: config.def.h
 .c.o:
 	$(CC) $(CSOCKS_CFLAGS) -c $<
 
-utils.o: config.h utils.h
-csocks.o: config.h
+utils.o: config.h utils.h csocks.h
+csocks.o: config.h csocks.h
 
 csocks: $(OBJ)
 	$(CC) -o $@ $(OBJ) $(CSOCKS_LDFLAGS)

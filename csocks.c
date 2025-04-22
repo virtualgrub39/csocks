@@ -15,36 +15,18 @@
 #include <signal.h>
 #include <errno.h>
 #include <pthread.h>
-#include <sys/stat.h>
 #include <netdb.h>
 #include <poll.h>
 #include <fcntl.h>
 
 #include "utils.h"
 #include "config.h"
+#include "csocks.h"
 
 FILE* log_file;
 FILE* auth_file = NULL;
 bool daemonized = false;
 unsigned long bind_port = 1080;
-
-enum sockserrcode {
-	SUCCESS,
-	GENERAL_FAILURE,
-	CONNECTION_NO_ALLOWED,
-	NETWORK_UNREACHABLE,
-	HOST_UNREACHABLE,
-	CONNECTION_REFUSED,
-	TTL_EXPIRED,
-	COMMAND_NOT_SUPPORTED,
-	ADDRESS_TYPE_NOT_SUPPORTED,
-};
-
-enum socksaddrtype {
-	IPV4 = 0x01,
-	DOMAINNAME = 0x03,
-	IPV6 = 0x04,
-};
 
 void
 usage(const char* progname)
@@ -60,55 +42,60 @@ usage(const char* progname)
 	exit(EXIT_SUCCESS);
 }
 
-void
-daemonize(void) // TODO: Does this even work? Haven't tested it.
+int
+main(int argc, char* argv[])
 {
-	pid_t pid;
-	int x;
+	int retval = 0;
+	log_file = stderr;
 
-	pid = fork();
+	while ((retval = getopt(argc, argv, "n:l:a:hd")) != -1) {
+		switch (retval) {
+		case 'd': {
+			daemonized = true;
+			daemonize();
+		} break;
+		case 'n': {
+			char* p = NULL;
+			bind_port = strtoul(optarg, &p, 10);
 
-	if (pid < 0) {
-		exit(EXIT_FAILURE);
+			if (*p != 0 || bind_port > 0xffff) {
+				fprintf(log_file, "Invalid port number\n");
+				exit(EXIT_FAILURE);
+			}
+		} break;
+		case 'l': {
+			freopen(optarg, "wa", log_file);
+			if (log_file == NULL) {
+				perror("Failed to open log file");
+				exit(EXIT_FAILURE);
+			}
+		} break;
+		case 'a': {
+			freopen(optarg, "r", auth_file);
+			if (auth_file == NULL) {
+				perror("Failed to open auth file");
+				exit(EXIT_FAILURE);
+			}
+		} break;
+		case 'h':
+		default: usage(argv[0]);
+		}
 	}
 
-	if (pid > 0) {
-		exit(EXIT_SUCCESS);
+	if (auth_file) {
+		log_msg(log_file, INFO, "Using auth file for USERPASS credentials");
+	} else {
+		log_msg(log_file, WARNING, "No auth file provided");
+		if (!auth_default_username || !auth_default_passwd) {
+			log_msg(log_file, WARNING, "USERNAME/PASSWORD authentication disabled");
+		}
+		log_msg(log_file, INFO, "Username: %s", auth_default_username);
+		log_msg(log_file, INFO, "Password: %s", auth_default_passwd);
 	}
 
-	if (setsid() < 0) {
-		exit(EXIT_FAILURE);
-	}
+	socks_serv_loop();
 
-	pid = fork();
-
-	if (pid < 0) {
-		exit(EXIT_FAILURE);
-	}
-
-	if (pid > 0) {
-		exit(EXIT_SUCCESS);
-	}
-
-	umask(0);
-	chdir("/");
-
-	for (x = sysconf(_SC_OPEN_MAX); x >= 0; x--) {
-		close(x);
-	}
-}
-
-// to prevent partial recv()'s
-static ssize_t
-recv_full(int fd, void *buf, size_t len, int flags) {
-	uint8_t *p = buf;
-	size_t got = 0;
-	while (got < len) {
-		ssize_t n = recv(fd, p + got, len - got, flags);
-		if (n <= 0) return n;
-		got += n;
-	}
-	return got;
+	return 0;
 }
 
 bool
@@ -201,43 +188,10 @@ socks_parse_addr(uint8_t atype, const char* addr, uint16_t port, struct sockaddr
     }
 }
 
-static char*
-get_addr_printable(int atype, uint8_t* addr)
-{
-    static _Thread_local char addrstring[INET6_ADDRSTRLEN + 1];
-    
-    switch (atype) {
-        case IPV4: {
-            snprintf(addrstring, sizeof(addrstring), "%d.%d.%d.%d",
-                     addr[0], addr[1], addr[2], addr[3]);
-            break;
-        }
-        case IPV6: {
-            snprintf(addrstring, sizeof(addrstring),
-                     "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-                     addr[0], addr[1], addr[2], addr[3],
-                     addr[4], addr[5], addr[6], addr[7],
-                     addr[8], addr[9], addr[10], addr[11],
-                     addr[12], addr[13], addr[14], addr[15]);
-            break;
-        }
-        case DOMAINNAME: {
-            strncpy(addrstring, (char*)addr, sizeof(addrstring) - 1);
-            addrstring[sizeof(addrstring) - 1] = '\0';
-            break;
-        }
-        default:
-            snprintf(addrstring, sizeof(addrstring), "<unknown address type>");
-            break;
-    }
-    
-    return addrstring;
-}
-
 int
 socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 {
-	enum sockserrcode errval = SUCCESS;
+	enum socks_error_code errval = SUCCESS;
 	uint8_t reply[10] = {
 		5,
 		(uint8_t) errval,
@@ -422,7 +376,7 @@ socks_udp_relay(int sockfd)
 }
 
 void
-socks_handle_request_default(int sockfd)
+socks_request_handle_default(int sockfd)
 {
 	uint8_t version = 0x05;
 	
@@ -433,13 +387,13 @@ socks_handle_request_default(int sockfd)
 	} command;
 	
 	uint8_t rsv = 0x00;
-	enum socksaddrtype atype;
+	enum socks_address_type atype;
 
 	uint8_t addr_buffer[256] = { 0 };
 	uint8_t addr_len = 0;
 	uint16_t addr_port = 0;
 	
-	enum sockserrcode errval = SUCCESS;
+	enum socks_error_code errval = SUCCESS;
 	uint8_t erreply[10] = {
 		version,
 		(uint8_t) errval,
@@ -538,7 +492,7 @@ handle_request_default_error:
 }
 
 void*
-client_conn_handler(void* arg)
+socks_client_connection_handler(void* arg)
 {
 	int client_sockfd = (int)(intptr_t)arg;
 
@@ -587,10 +541,10 @@ client_conn_handler(void* arg)
 			// authentication failed
 			goto client_handler_end;
 		}
-		socks_handle_request_default(client_sockfd);
+		socks_request_handle_default(client_sockfd);
 		break; // implicit falling through is forbidden with -Wextra apparently.
 	case NOAUTH:
-		socks_handle_request_default(client_sockfd);
+		socks_request_handle_default(client_sockfd);
 		break;
 	default:
 		log_msg(log_file, ERROR, "Unsupported authentication method: %02X", method);
@@ -604,7 +558,7 @@ client_handler_end:
 }
 
 void
-serv_loop(void)
+socks_serv_loop(void)
 {
 	signal(SIGPIPE, SIG_IGN);
 
@@ -656,7 +610,7 @@ serv_loop(void)
 		}
 
 		pthread_t t;
-		if (pthread_create(&t, NULL, &client_conn_handler, (void*)(intptr_t)client_sockfd) == 0) {
+		if (pthread_create(&t, NULL, &socks_client_connection_handler, (void*)(intptr_t)client_sockfd) == 0) {
 			pthread_detach(t);
 		} else {
 			log_msg(log_file, ERROR, "pthread_detach(): %u", errno);
@@ -668,62 +622,6 @@ serv_loop(void)
 sock_err:
 	close(serv_sockfd);
 	exit(1);
-}
-
-int
-main(int argc, char* argv[])
-{
-	int retval = 0;
-	log_file = stderr;
-
-	while ((retval = getopt(argc, argv, "n:l:a:hd")) != -1) {
-		switch (retval) {
-		case 'd': {
-			daemonized = true;
-			daemonize();
-		} break;
-		case 'n': {
-			char* p = NULL;
-			bind_port = strtoul(optarg, &p, 10);
-
-			if (*p != 0 || bind_port > 0xffff) {
-				fprintf(log_file, "Invalid port number\n");
-				exit(EXIT_FAILURE);
-			}
-		} break;
-		case 'l': {
-			freopen(optarg, "wa", log_file);
-			if (log_file == NULL) {
-				perror("Failed to open log file");
-				exit(EXIT_FAILURE);
-			}
-		} break;
-		case 'a': {
-			freopen(optarg, "r", auth_file);
-			if (auth_file == NULL) {
-				perror("Failed to open auth file");
-				exit(EXIT_FAILURE);
-			}
-		} break;
-		case 'h':
-		default: usage(argv[0]);
-		}
-	}
-
-	if (auth_file) {
-		log_msg(log_file, INFO, "Using auth file for USERPASS credentials");
-	} else {
-		log_msg(log_file, WARNING, "No auth file provided");
-		if (!auth_default_username || !auth_default_passwd) {
-			log_msg(log_file, WARNING, "USERNAME/PASSWORD authentication disabled");
-		}
-		log_msg(log_file, INFO, "Username: %s", auth_default_username);
-		log_msg(log_file, INFO, "Password: %s", auth_default_passwd);
-	}
-
-	serv_loop();
-
-	return 0;
 }
 
 // TODO: auth file format definition and parsing
