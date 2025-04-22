@@ -143,43 +143,62 @@ socks_auth_userpass(int sockfd)
 	return false;
 }
 
-bool
-socks_parse_addr(int atype, uint8_t* addr, uint16_t port, struct sockaddr_storage* sa, socklen_t* sa_len)
-{
-	switch (atype) {
-	case IPV4: {
-		struct sockaddr_in* sa4 = (struct sockaddr_in*)sa;
-
-		sa4->sin_family = AF_INET;
-		sa4->sin_port = htons(port);
-		memcpy(&sa4->sin_addr.s_addr, addr, 4);
-		*sa_len = sizeof(struct sockaddr_in);
-	} break;
-	case IPV6: {
-		struct sockaddr_in6* sa6 = (struct sockaddr_in6*)sa;
-
-		sa6->sin6_family = AF_INET6;
-		sa6->sin6_port = htons(port);
-		memcpy(&sa6->sin6_addr.s6_addr, addr, 16);
-		*sa_len = sizeof(struct sockaddr_in6);
-	} break;
-	case DOMAINNAME: {
-		struct sockaddr_in* sa4 = (struct sockaddr_in*)sa;
-
-		struct hostent* he = gethostbyname((char*)addr);
-		if (!he) return false;
-
-		sa4->sin_family = AF_INET;
-		sa4->sin_port = htons(port);
-		memcpy(&sa4->sin_addr, he->h_addr, he->h_length);
-		*sa_len = sizeof(he->h_length);
-
-	    break;
-	}
-	default: UNREACHABLE;
-	}
-
-	return true;
+int
+socks_parse_addr(uint8_t atype, const char* addr, uint16_t port, struct sockaddr_storage* sa, socklen_t* sa_len) {
+    memset(sa, 0, sizeof(struct sockaddr_storage));
+    
+    switch (atype) {
+        case IPV4: {
+            struct sockaddr_in* sin = (struct sockaddr_in*)sa;
+            sin->sin_family = AF_INET;
+            sin->sin_port = htons(port);
+            if (inet_pton(AF_INET, addr, &sin->sin_addr) != 1) {
+                return 0;
+            }
+            *sa_len = sizeof(struct sockaddr_in);
+            return 1;
+        }
+        
+        case IPV6: {
+            struct sockaddr_in6* sin6 = (struct sockaddr_in6*)sa;
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_port = htons(port);
+            if (inet_pton(AF_INET6, addr, &sin6->sin6_addr) != 1) {
+                return 0;
+            }
+            *sa_len = sizeof(struct sockaddr_in6);
+            return 1;
+        }
+        
+        case DOMAINNAME: {
+            struct addrinfo hints, *result;
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family = AF_UNSPEC;    // Allow IPv4 or IPv6
+            hints.ai_socktype = SOCK_STREAM;
+            
+            char port_str[8];
+            snprintf(port_str, sizeof(port_str), "%d", port);
+            
+            int res = getaddrinfo(addr, port_str, &hints, &result);
+            if (res != 0) {
+                fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(res));
+                return 0;
+            }
+            
+            if (result == NULL) {
+                return 0;
+            }
+            
+            memcpy(sa, result->ai_addr, result->ai_addrlen);
+            *sa_len = result->ai_addrlen;
+            
+            freeaddrinfo(result);
+            return 1;
+        }
+        
+        default:
+            return 0;
+    }
 }
 
 static char*
@@ -231,34 +250,34 @@ socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 	int netsockfd = -1;
 	struct sockaddr_storage sa = { 0 };
 	socklen_t sa_len = 0;
-	// I love IPv6, such a useful protocol :)
 
 	log_msg(log_file, INFO, "Request: CONNECT %s:%u", get_addr_printable(atype, addr), port);
 
-	if (!socks_parse_addr(atype, addr, port, &sa, &sa_len)) {
+	if (!socks_parse_addr(atype, (char*)addr, port, &sa, &sa_len)) {
+		log_msg(log_file, ERROR, "Failed to parse address");
+
 		errval = GENERAL_FAILURE;
 		goto socks_connect_error;
 	}
 
-	switch (atype) {
-	case IPV4: {
-		netsockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	} break;
-	case IPV6: {
-		netsockfd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-	} break;
-	case DOMAINNAME: {
-	    netsockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	} break;
-	default: UNREACHABLE;
+    netsockfd = socket(sa.ss_family, SOCK_STREAM, IPPROTO_TCP);
+
+    int optval = 1;
+	if (setsockopt(netsockfd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval)) < 0) {
+		log_msg(log_file, ERROR, "setsockopt(TCP_NODELAY): %u", errno);
+		close(netsockfd);
+		errval = GENERAL_FAILURE;
+		goto socks_connect_error;
 	}
 
 	if (connect(netsockfd, (struct sockaddr*)&sa, sa_len) < 0) {
-		errval = GENERAL_FAILURE;
+		log_msg(log_file, ERROR, "Couldn't connect to specified address: %s", strerror(errno));
+		errval = HOST_UNREACHABLE;
 		goto socks_connect_error;
 	}
 
 	if (getsockname(netsockfd, (struct sockaddr*)&sa, &sa_len) < 0) {
+		log_msg(log_file, ERROR, "Couldn't read socket address: %s", strerror(errno));
 		close(netsockfd);
 		errval = GENERAL_FAILURE;
 		goto socks_connect_error;
@@ -276,6 +295,8 @@ socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 		TODO("socks_connect() IPv6");
 	} break;
 	default:
+		log_msg(log_file, ERROR, "Invalid address lenght");
+		close(netsockfd);
 		errval = GENERAL_FAILURE;
 		goto socks_connect_error;
 	}
@@ -320,7 +341,8 @@ socks_udp_associate(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 void
 socks_tcp_pipe(int Afd, int Bfd)
 {
-	log_msg(log_file, INFO, "Piping TCP sockets %d <-> %d", Afd, Bfd);
+	log_msg(log_file, INFO, "Created TCP pipe %d >===< %d", Afd, Bfd);
+	uint64_t bcount = 0;
 
     int pipeAB[2], pipeBA[2];
     struct pollfd fds[2] = {
@@ -331,6 +353,8 @@ socks_tcp_pipe(int Afd, int Bfd)
         log_msg(log_file, ERROR, "pipe() Failed: %s", strerror(errno));
         return;
     }
+    bool a_eof = false, b_eof = false;
+    // ^ quiting only when both sockets read eof is the correct behavior supposedly
 
     for (EVER) {
         int ret = poll(fds, 2, -1);
@@ -338,12 +362,18 @@ socks_tcp_pipe(int Afd, int Bfd)
         if (ret <= 0) break;
 
         /* A → B */
-        if (fds[0].revents & POLLIN) {
+        if (fds[0].revents & POLLIN && !a_eof) {
             ssize_t n = splice(Afd, NULL,
                                pipeAB[1], NULL,
                                SPLICE_SIZE,
                                SPLICE_F_MOVE | SPLICE_F_MORE);
-            if (n <= 0) break;
+            if (n < 0) break;
+            if (n == 0) {
+            	a_eof = true;
+            	usleep(100000); // let shit flush
+            	shutdown(Bfd, SHUT_WR);
+            }
+            bcount += n;
             if (splice(pipeAB[0], NULL,
                        Bfd,     NULL,
                        n,
@@ -352,12 +382,18 @@ socks_tcp_pipe(int Afd, int Bfd)
         }
 
         /* B → A */
-        if (fds[1].revents & POLLIN) {
+        if (fds[1].revents & POLLIN && !b_eof) {
             ssize_t n = splice(Bfd, NULL,
                                pipeBA[1], NULL,
                                SPLICE_SIZE,
                                SPLICE_F_MOVE | SPLICE_F_MORE);
-            if (n <= 0) break;
+            if (n < 0) break;
+            if (n == 0) {
+            	b_eof = true;
+            	usleep(100000); // let shit flush
+            	shutdown(Afd, SHUT_WR);
+            }
+            bcount += n;
             if (splice(pipeBA[0], NULL,
                        Afd,     NULL,
                        n,
@@ -368,12 +404,13 @@ socks_tcp_pipe(int Afd, int Bfd)
         if ((fds[0].revents | fds[1].revents) &
             (POLLERR|POLLHUP|POLLNVAL))
             break;
+        if (a_eof && b_eof) break;
     }
 
     close(pipeAB[0]); close(pipeAB[1]);
     close(pipeBA[0]); close(pipeBA[1]);
 
-	log_msg(log_file, INFO, "Stopped piping TCP sockets %d <-> %d", Afd, Bfd);
+	log_msg(log_file, INFO, "Destroyed TCP pipe %d >===< %d (%llu bytes transfered)", Afd, Bfd, bcount);
 }
 
 void
@@ -612,7 +649,7 @@ serv_loop(void)
 		}
 
 		optval = 1;
-		if (setsockopt(serv_sockfd, SOL_TCP, TCP_NODELAY, &optval, sizeof(optval)) < 0) {
+		if (setsockopt(serv_sockfd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval)) < 0) {
 			log_msg(log_file, ERROR, "setsockopt(TCP_NODELAY): %u", errno);
 			close(client_sockfd);
 			goto sock_err;
@@ -693,5 +730,6 @@ main(int argc, char* argv[])
 // TODO: non-blocking sockets?
 // TODO: workers / thread pool instead of thread per connection?
 // TODO: other authentication methods
-// TODO: ipv6 support
+// TODO: FULL ipv6 support
 // TODO: GSSAPI support?
+// TODO: logging is fucked up, and I don't want mutexes. Create some kind of buffer for logging / logging thread?

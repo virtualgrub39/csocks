@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 
-#define LISTEN_BACKLOG_SIZE 10
+#define LISTEN_BACKLOG_SIZE 25
 #define SPLICE_SIZE 64 * 1024
 
 /* SET BOTH TO NULL TO DISABLE DEFAULTS */
