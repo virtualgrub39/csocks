@@ -46,4 +46,4 @@ No rows are ignored.
 
 ## License
 
-Do whatever (see [UNLICENSE](UNLICENSE)).
+`csocks` is licensed under the [UNLICENSE](UNLICENSE) or [MIT-0](LICENSE); you may choose the one you prefer.
