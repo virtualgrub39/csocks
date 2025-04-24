@@ -189,7 +189,7 @@ socks_parse_addr(uint8_t atype, const char* addr, uint16_t port, struct sockaddr
 }
 
 int
-socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
+socks_connect(int client_sockfd, struct sockaddr_storage* addr, socklen_t addr_len)
 {
 	enum socks_error_code errval = SUCCESS;
 	uint8_t reply[10] = {
@@ -202,19 +202,8 @@ socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 	};
 
 	int netsockfd = -1;
-	struct sockaddr_storage sa = { 0 };
-	socklen_t sa_len = 0;
 
-	log_msg(log_file, INFO, "Request: CONNECT %s:%u", get_addr_printable(atype, addr), port);
-
-	if (!socks_parse_addr(atype, (char*)addr, port, &sa, &sa_len)) {
-		log_msg(log_file, ERROR, "Failed to parse address");
-
-		errval = GENERAL_FAILURE;
-		goto socks_connect_error;
-	}
-
-    netsockfd = socket(sa.ss_family, SOCK_STREAM, IPPROTO_TCP);
+    netsockfd = socket(addr->ss_family, SOCK_STREAM, IPPROTO_TCP);
 
     int optval = 1;
 	if (setsockopt(netsockfd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval)) < 0) {
@@ -224,57 +213,103 @@ socks_connect(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
 		goto socks_connect_error;
 	}
 
-	if (connect(netsockfd, (struct sockaddr*)&sa, sa_len) < 0) {
+	if (connect(netsockfd, (struct sockaddr*)addr, addr_len) < 0) {
 		log_msg(log_file, ERROR, "Couldn't connect to specified address: %s", strerror(errno));
-		errval = HOST_UNREACHABLE;
+		if (errno == ECONNREFUSED) errval = CONNECTION_REFUSED;
+		if (errno == EHOSTUNREACH) errval = HOST_UNREACHABLE;
 		goto socks_connect_error;
 	}
 
-	if (getsockname(netsockfd, (struct sockaddr*)&sa, &sa_len) < 0) {
+	if (getsockname(netsockfd, (struct sockaddr*)addr, &addr_len) < 0) {
 		log_msg(log_file, ERROR, "Couldn't read socket address: %s", strerror(errno));
 		close(netsockfd);
 		errval = GENERAL_FAILURE;
 		goto socks_connect_error;
 	}
 
-	switch (sa_len) {
-	case sizeof(struct sockaddr_in): {
-		reply[1] = SUCCESS;
-		memcpy(reply + 4, &((struct sockaddr_in*)&sa)->sin_addr.s_addr, 4);
-		memcpy(reply + 8, &((struct sockaddr_in*)&sa)->sin_port, 2);
-
-		write(client_sockfd, reply, 10);
-	} break;
-	case sizeof(struct sockaddr_in6): {
-		TODO("socks_connect() IPv6");
-	} break;
-	default:
-		log_msg(log_file, ERROR, "Invalid address lenght");
-		close(netsockfd);
-		errval = GENERAL_FAILURE;
-		goto socks_connect_error;
-	}
+	if (socks_reply(client_sockfd, addr, addr_len) < 0) goto socks_connect_done;
 
 	return netsockfd;
 
 socks_connect_error:
  	reply[1] = errval;
 	write(client_sockfd, reply, 10);
-
+socks_connect_done:
 	log_msg(log_file, WARNING, "Connect request failed with errval: %u", errval);
 
 	return -1;
 }
 
 int
-socks_bind(int client_sockfd, int atype, uint8_t* addr, uint16_t port)
+socks_bind(int client_sockfd, struct sockaddr_storage* addr, socklen_t addr_len)
 {
-	(void)client_sockfd;
-	(void)atype;
-	(void)addr;
-	(void)port;
+	enum socks_error_code errval = SUCCESS;
+	uint8_t reply[10] = {
+		5,
+		(uint8_t) errval,
+		0x00,
+		IPV4,
+		0, 0, 0, 0,
+		0, 0
+	};
 
-	TODO("socks_bind()");
+	int netsockfd = -1;
+
+    netsockfd = socket(addr->ss_family, SOCK_STREAM, IPPROTO_TCP);
+
+    int optval = 1;
+	if (setsockopt(netsockfd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval)) < 0) {
+		log_msg(log_file, ERROR, "setsockopt(TCP_NODELAY): %u", errno);
+		close(netsockfd);
+		errval = GENERAL_FAILURE;
+		goto socks_bind_error;
+	}
+
+	if (bind(netsockfd, (struct sockaddr*)addr, addr_len) < 0) {
+		log_msg(log_file, ERROR, "Couldn't bind to specified address: %s", strerror(errno));
+		errval = GENERAL_FAILURE;
+		goto socks_bind_error;
+	}
+
+	if (getsockname(netsockfd, (struct sockaddr*)addr, &addr_len) < 0) {
+		log_msg(log_file, ERROR, "Couldn't read socket address: %s", strerror(errno));
+		close(netsockfd);
+		errval = GENERAL_FAILURE;
+		goto socks_bind_error;
+	}
+
+	if (listen(netsockfd, 1) < 0) {
+		log_msg(log_file, ERROR, "listen(netsockfd): %u", errno);
+		close(netsockfd);
+		errval = GENERAL_FAILURE;
+		goto socks_bind_error;
+	}
+
+	if (socks_reply(client_sockfd, addr, addr_len) < 0) {
+		close(netsockfd);
+		goto socks_bind_done;
+	}
+
+	int data_sockfd = accept(netsockfd, (struct sockaddr*)addr, &addr_len);
+	if (data_sockfd < 0) {
+		errval = GENERAL_FAILURE;
+		close(netsockfd);
+		goto socks_bind_error;
+	}
+
+	if (socks_reply(client_sockfd, addr, addr_len) < 0) {
+		close(netsockfd);
+		goto socks_bind_done;
+	}
+
+	close(netsockfd);
+	return data_sockfd;
+
+socks_bind_error:
+ 	reply[1] = errval;
+	write(client_sockfd, reply, 10);
+socks_bind_done:
+	log_msg(log_file, WARNING, "Connect request failed with errval: %u", errval);
 
 	return -1;
 }
@@ -379,14 +414,9 @@ void
 socks_request_handle_default(int sockfd)
 {
 	uint8_t version = 0x05;
-	
-	enum {
-		CONNECT = 0x01,
-		BIND = 0x02,
-		UDP_ASSOCIATE = 0x03,
-	} command;
-	
-	uint8_t rsv = 0x00;
+	uint8_t rsv;
+
+	enum socks_command command;
 	enum socks_address_type atype;
 
 	uint8_t addr_buffer[256] = { 0 };
@@ -463,11 +493,23 @@ socks_request_handle_default(int sockfd)
 
 	int netsockfd = -1;
 
+	struct sockaddr_storage sa = { 0 };
+	socklen_t sa_len = 0;
+
+	if (!socks_parse_addr(atype, (char*)addr_buffer, addr_port, &sa, &sa_len)) {
+		log_msg(log_file, ERROR, "Failed to parse address");
+
+		errval = GENERAL_FAILURE;
+		goto handle_request_default_error;
+	}
+
 	switch (command) {
 	case CONNECT:
-		netsockfd = socks_connect(sockfd, atype, addr_buffer, addr_port); break;
+		log_msg(log_file, INFO, "Request: CONNECT %s:%u", get_addr_printable(atype, addr_buffer), addr_port);
+		netsockfd = socks_connect(sockfd, &sa, sa_len); break;
 	case BIND:
-		netsockfd = socks_bind(sockfd, atype, addr_buffer, addr_port); break;
+		log_msg(log_file, INFO, "Request: BIND %s:%u", get_addr_printable(atype, addr_buffer), addr_port);
+		netsockfd = socks_bind(sockfd, &sa, sa_len); break;
 	case UDP_ASSOCIATE:
 		netsockfd = socks_udp_associate(sockfd, atype, addr_buffer, addr_port); break;
 	default:
@@ -622,6 +664,39 @@ socks_serv_loop(void)
 sock_err:
 	close(serv_sockfd);
 	exit(1);
+}
+
+int
+socks_reply(int sockfd, struct sockaddr_storage* addr, socklen_t addr_len)
+{
+	uint8_t reply[22] = {
+		5,
+		0,
+		0x00,
+		IPV4,
+	};
+	memset(reply + 4, 0, 18);
+
+	switch (addr_len) {
+	case sizeof(struct sockaddr_in): {
+		reply[1] = SUCCESS;
+
+		memcpy(reply + 4, &((struct sockaddr_in*)addr)->sin_addr.s_addr, 4);
+		memcpy(reply + 8, &((struct sockaddr_in*)addr)->sin_port, 2);
+
+		return write(sockfd, reply, 10);
+	} break;
+	case sizeof(struct sockaddr_in6): {
+		TODO("socks_connect() IPv6");
+	} break;
+	case 0:
+	default:
+		reply[1] = GENERAL_FAILURE;
+		write(sockfd, reply, 10);
+		return -1;
+	}
+
+	UNREACHABLE;
 }
 
 // TODO: auth file format definition and parsing
